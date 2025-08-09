@@ -689,9 +689,34 @@ def train_models(df, feature_cols, params, train_ratio=0.8, split_method='time')
     lgbm_full.fit(X_full_sel, df['sales_volume'])
     rf_full.fit(X_full_sel, df['sales_volume'])
 
+    # Train quantile LightGBM models for confidence intervals
+    conf_level = params.get('confidence_level', 0.95)
+    alpha_lower = (1 - conf_level) / 2
+    alpha_upper = 1 - alpha_lower
+    lgbm_lower = lgb.LGBMRegressor(
+        objective='quantile',
+        alpha=alpha_lower,
+        learning_rate=params.get('lgbm_learning_rate', 0.01),
+        n_estimators=params.get('lgbm_n_estimators', 1000),
+        max_depth=params.get('lgbm_max_depth', 7),
+        random_state=42
+    )
+    lgbm_upper = lgb.LGBMRegressor(
+        objective='quantile',
+        alpha=alpha_upper,
+        learning_rate=params.get('lgbm_learning_rate', 0.01),
+        n_estimators=params.get('lgbm_n_estimators', 1000),
+        max_depth=params.get('lgbm_max_depth', 7),
+        random_state=42
+    )
+    lgbm_lower.fit(X_full_sel, df['sales_volume'])
+    lgbm_upper.fit(X_full_sel, df['sales_volume'])
+
     # Return model bundle with all necessary components
     model_bundle = {
         'models': {'lgbm': lgbm_full, 'rf': rf_full},
+        'quantile_models': {'lower': lgbm_lower, 'upper': lgbm_upper},
+        'confidence_level': conf_level,
         'imputer': imputer_full,
         'selector': selector_full,
         'feature_cols': feature_cols,
@@ -734,13 +759,13 @@ def generate_forecast(model_bundle, history, steps, include_confidence=True, con
     ensemble_method = model_bundle['ensemble_method']
     lgbm_weight = model_bundle['lgbm_weight']
     residual_std = model_bundle['residual_std']
-    
-    # Get test data metrics for better confidence intervals
+
+    # Get test data metrics for fallback confidence intervals
     test_data = model_bundle.get('test_data', {})
     y_test = test_data.get('y_test', pd.Series(dtype=float))
     y_pred = test_data.get('y_pred', pd.Series(dtype=float))
-    
-    # Calculate error metrics if available
+    quantile_models = model_bundle.get('quantile_models')
+
     if len(y_test) > 0 and len(y_pred) > 0:
         mae = mean_absolute_error(y_test, y_pred)
         rmse = np.sqrt(mean_squared_error(y_test, y_pred))
@@ -826,13 +851,20 @@ def generate_forecast(model_bundle, history, steps, include_confidence=True, con
 
         # Calculate confidence intervals with increasing uncertainty over time
         if include_confidence:
-            # Increase uncertainty for longer forecast horizons
-            step_factor = 1 + (step * 0.1)  # 10% increase in uncertainty per step
-            margin = z * error_estimate * step_factor
-            
-            # Ensure lower bound is non-negative
-            lower.append(max(0, forecast[0] - margin))
-            upper.append(forecast[0] + margin)
+            if quantile_models is not None:
+                pred_lower = quantile_models['lower'].predict(features_sel)
+                pred_upper = quantile_models['upper'].predict(features_sel)
+                step_factor = 1 + (step * 0.1)
+                mid = (pred_lower[0] + pred_upper[0]) / 2
+                half_width = (pred_upper[0] - pred_lower[0]) / 2 * step_factor
+                lower.append(max(0, mid - half_width))
+                upper.append(mid + half_width)
+            else:
+                # Fallback to residual-based intervals
+                step_factor = 1 + (step * 0.1)  # 10% increase in uncertainty per step
+                margin = z * error_estimate * step_factor
+                lower.append(max(0, forecast[0] - margin))
+                upper.append(forecast[0] + margin)
 
         # Update history with the forecasted value for next iteration
         history.loc[history.index[-1], 'sales_volume'] = forecast[0]
@@ -843,6 +875,7 @@ def generate_forecast(model_bundle, history, steps, include_confidence=True, con
         'values': forecasts,
         'lower_bounds': lower if include_confidence else [],
         'upper_bounds': upper if include_confidence else [],
+        'confidence_level': model_bundle.get('confidence_level', confidence_level) if include_confidence else None,
     }
     return result
 
@@ -882,6 +915,12 @@ def generate_detailed_forecast(res, group_eng, product, forecast_weeks, forecast
     feature_selection_enabled = res.get('feature_selection_enabled', False)
     ensemble_method = res.get('ensemble_method', 'Average')
     lgbm_weight = res.get('lgbm_weight', 0.5)
+    quantile_models = res.get('quantile_models')
+    conf_level = res.get('confidence_level', confidence_level)
+
+    mae = metrics.get('MAE', 0)
+    rmse = metrics.get('RMSE', 0)
+    error_estimate = (0.7 * mae) + (0.3 * rmse)
 
     if not feature_cols or lgbm is None or rf is None or imputer is None:
         return {
@@ -892,7 +931,7 @@ def generate_detailed_forecast(res, group_eng, product, forecast_weeks, forecast
             'upper_bounds': [],
             'method': forecast_method,
             'horizon': forecast_weeks,
-            'confidence_level': confidence_level if include_confidence else None,
+            'confidence_level': conf_level if include_confidence else None,
         }
 
     group_eng = group_eng.copy()
@@ -1007,32 +1046,30 @@ def generate_detailed_forecast(res, group_eng, product, forecast_weeks, forecast
             else:
                 ensemble_pred_future = (pred_lgbm_future + pred_rf_future) / 2
 
-            forecast_values.append(ensemble_pred_future[0])
+            forecast_value = ensemble_pred_future[0]
+            forecast_values.append(forecast_value)
 
             if include_confidence:
-                mae = metrics.get('MAE', 0)
-                rmse = metrics.get('RMSE', 0)
-                error_estimate = (0.7 * mae) + (0.3 * rmse)
-                z_score = 1.96
-                if confidence_level == 0.99:
-                    z_score = 2.58
-                elif confidence_level == 0.9:
-                    z_score = 1.645
-                elif confidence_level == 0.85:
-                    z_score = 1.44
-                elif confidence_level == 0.8:
-                    z_score = 1.28
-                if is_hobc:
-                    step_factor = 1 + (i * 0.2)
-                    min_margin = 2000 * (i + 1)
+                if quantile_models is not None:
+                    pred_lower = quantile_models['lower'].predict(X_future_sel)[0]
+                    pred_upper = quantile_models['upper'].predict(X_future_sel)[0]
+                    step_factor = 1 + (i * (0.2 if is_hobc else 0.1))
+                    mid = (pred_lower + pred_upper) / 2
+                    half_width = (pred_upper - pred_lower) / 2 * step_factor
+                    lower_bounds.append(max(0, mid - half_width))
+                    upper_bounds.append(mid + half_width)
                 else:
-                    step_factor = 1 + (i * 0.1)
-                    min_margin = 0
-                margin = max(z_score * error_estimate * step_factor, min_margin)
-                forecast_value = max(ensemble_pred_future[0], margin/2)
-                forecast_values[-1] = forecast_value
-                lower_bounds.append(max(0, forecast_value - margin))
-                upper_bounds.append(forecast_value + margin)
+                    z_lookup = {0.99: 2.58, 0.95: 1.96, 0.9: 1.645, 0.85: 1.44, 0.8: 1.28}
+                    z_score = z_lookup.get(conf_level, 1.96)
+                    if is_hobc:
+                        step_factor = 1 + (i * 0.2)
+                        min_margin = 2000 * (i + 1)
+                    else:
+                        step_factor = 1 + (i * 0.1)
+                        min_margin = 0
+                    margin = max(z_score * error_estimate * step_factor, min_margin)
+                    lower_bounds.append(max(0, forecast_value - margin))
+                    upper_bounds.append(forecast_value + margin)
             else:
                 lower_bounds.append(None)
                 upper_bounds.append(None)
@@ -1147,30 +1184,26 @@ def generate_detailed_forecast(res, group_eng, product, forecast_weeks, forecast
             # Store the forecast
             forecast_values.append(forecast_value)
             prediction_history.append(forecast_value)
-            
+
             # Update the sales volume in the current data for the next iteration
             forecast_history.loc[forecast_history.index[-1], 'sales_volume'] = forecast_value
-            
-            # Calculate confidence intervals with increasing width over time
+
             if include_confidence:
-                # Get error metrics
-                mae = metrics.get('MAE', 0)
-                rmse = metrics.get('RMSE', 0)
-                error_estimate = (0.7 * mae) + (0.3 * rmse)
-                
-                # Get z-score based on confidence level
-                z_lookup = {0.99: 2.58, 0.95: 1.96, 0.9: 1.645, 0.85: 1.44, 0.8: 1.28}
-                z_score = z_lookup.get(confidence_level, 1.96)
-                
-                # Increase uncertainty for longer forecast horizons
-                step_factor = 1 + 0.15 * (i + 1)  # 15% increase per step
-                
-                # Calculate margin of error
-                margin = z_score * error_estimate * step_factor
-                
-                # Ensure lower bound is non-negative
-                lower_bounds.append(max(0, forecast_value - margin))
-                upper_bounds.append(forecast_value + margin)
+                if quantile_models is not None:
+                    pred_lower = quantile_models['lower'].predict(X_future_sel)[0]
+                    pred_upper = quantile_models['upper'].predict(X_future_sel)[0]
+                    step_factor = 1 + 0.15 * (i + 1)
+                    mid = (pred_lower + pred_upper) / 2
+                    half_width = (pred_upper - pred_lower) / 2 * step_factor
+                    lower_bounds.append(max(0, mid - half_width))
+                    upper_bounds.append(mid + half_width)
+                else:
+                    z_lookup = {0.99: 2.58, 0.95: 1.96, 0.9: 1.645, 0.85: 1.44, 0.8: 1.28}
+                    z_score = z_lookup.get(conf_level, 1.96)
+                    step_factor = 1 + 0.15 * (i + 1)
+                    margin = z_score * error_estimate * step_factor
+                    lower_bounds.append(max(0, forecast_value - margin))
+                    upper_bounds.append(forecast_value + margin)
             else:
                 lower_bounds.append(None)
                 upper_bounds.append(None)
@@ -1183,7 +1216,7 @@ def generate_detailed_forecast(res, group_eng, product, forecast_weeks, forecast
         'upper_bounds': upper_bounds,
         'method': forecast_method,
         'horizon': forecast_weeks,
-        'confidence_level': confidence_level if include_confidence else None,
+        'confidence_level': conf_level if include_confidence else None,
     }
 
 # Helper function to convert datetime columns to strings for Streamlit display
