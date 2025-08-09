@@ -638,14 +638,16 @@ def train_models(df, feature_cols, params, train_ratio=0.8, split_method='time')
     else:
         ensemble_pred = (pred_lgbm + pred_rf) / 2
 
-    # Calculate metrics and residual standard deviation
+    # Calculate metrics and residual statistics
     metrics = evaluate_preds(y_test, ensemble_pred)
-    residual_std = float(np.std(y_test - ensemble_pred, ddof=1)) if len(y_test) > 1 else 0.0
-    
-    # Store test set and predictions for later use
+    residuals = (y_test - ensemble_pred).to_numpy()
+    residual_std = float(np.std(residuals, ddof=1)) if len(residuals) > 1 else 0.0
+
+    # Store test set, predictions, and residuals for later use
     test_data = {
         'y_test': y_test,
         'y_pred': ensemble_pred,
+        'residuals': residuals,
         'test_df': test
     }
 
@@ -700,7 +702,8 @@ def train_models(df, feature_cols, params, train_ratio=0.8, split_method='time')
         'lgbm_weight': params.get('lgbm_weight', 0.5),
         'residual_std': residual_std,
         'metrics': metrics,
-        'test_data': test_data
+        'test_data': test_data,
+        'residuals': residuals
     }
     return model_bundle
 
@@ -738,15 +741,11 @@ def generate_forecast(model_bundle, history, steps, include_confidence=True, con
     # Get test data metrics for better confidence intervals
     test_data = model_bundle.get('test_data', {})
     y_test = test_data.get('y_test', pd.Series(dtype=float))
-    y_pred = test_data.get('y_pred', pd.Series(dtype=float))
-    
-    # Calculate error metrics if available
-    if len(y_test) > 0 and len(y_pred) > 0:
-        mae = mean_absolute_error(y_test, y_pred)
-        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-        error_estimate = (0.7 * mae) + (0.3 * rmse)
+    residuals = model_bundle.get('residuals')
+    if residuals is None or len(residuals) == 0:
+        residuals = np.array([residual_std])
     else:
-        error_estimate = residual_std
+        residuals = np.asarray(residuals)
 
     # Prepare history data
     history = history.copy().sort_values('week_start')
@@ -755,8 +754,6 @@ def generate_forecast(model_bundle, history, steps, include_confidence=True, con
 
     # Initialize forecast containers
     forecasts, dates, lower, upper = [], [], [], []
-    z_lookup = {0.99: 2.58, 0.95: 1.96, 0.9: 1.645, 0.8: 1.28}
-    z = z_lookup.get(confidence_level, 1.96)
 
     # Generate forecasts iteratively
     for step in range(steps):
@@ -824,15 +821,14 @@ def generate_forecast(model_bundle, history, steps, include_confidence=True, con
         forecasts.append(forecast[0])
         dates.append(next_date)
 
-        # Calculate confidence intervals with increasing uncertainty over time
+        # Calculate confidence intervals with residual bootstrapping
         if include_confidence:
-            # Increase uncertainty for longer forecast horizons
-            step_factor = 1 + (step * 0.1)  # 10% increase in uncertainty per step
-            margin = z * error_estimate * step_factor
-            
-            # Ensure lower bound is non-negative
-            lower.append(max(0, forecast[0] - margin))
-            upper.append(forecast[0] + margin)
+            step_factor = 1 + (step * 0.1)
+            samples = forecast[0] + np.random.choice(residuals, size=1000, replace=True) * step_factor
+            lower_q = (1 - confidence_level) / 2
+            upper_q = 1 - lower_q
+            lower.append(max(0, np.quantile(samples, lower_q)))
+            upper.append(np.quantile(samples, upper_q))
 
         # Update history with the forecasted value for next iteration
         history.loc[history.index[-1], 'sales_volume'] = forecast[0]
@@ -1007,32 +1003,17 @@ def generate_detailed_forecast(res, group_eng, product, forecast_weeks, forecast
             else:
                 ensemble_pred_future = (pred_lgbm_future + pred_rf_future) / 2
 
-            forecast_values.append(ensemble_pred_future[0])
+            forecast_value = ensemble_pred_future[0]
+            forecast_values.append(forecast_value)
 
             if include_confidence:
-                mae = metrics.get('MAE', 0)
-                rmse = metrics.get('RMSE', 0)
-                error_estimate = (0.7 * mae) + (0.3 * rmse)
-                z_score = 1.96
-                if confidence_level == 0.99:
-                    z_score = 2.58
-                elif confidence_level == 0.9:
-                    z_score = 1.645
-                elif confidence_level == 0.85:
-                    z_score = 1.44
-                elif confidence_level == 0.8:
-                    z_score = 1.28
-                if is_hobc:
-                    step_factor = 1 + (i * 0.2)
-                    min_margin = 2000 * (i + 1)
-                else:
-                    step_factor = 1 + (i * 0.1)
-                    min_margin = 0
-                margin = max(z_score * error_estimate * step_factor, min_margin)
-                forecast_value = max(ensemble_pred_future[0], margin/2)
-                forecast_values[-1] = forecast_value
-                lower_bounds.append(max(0, forecast_value - margin))
-                upper_bounds.append(forecast_value + margin)
+                residuals = np.asarray(res.get('residuals', np.array([0.0])))
+                step_factor = 1 + (i * (0.2 if is_hobc else 0.1))
+                samples = forecast_value + np.random.choice(residuals, size=1000, replace=True) * step_factor
+                lower_q = (1 - confidence_level) / 2
+                upper_q = 1 - lower_q
+                lower_bounds.append(max(0, np.quantile(samples, lower_q)))
+                upper_bounds.append(np.quantile(samples, upper_q))
             else:
                 lower_bounds.append(None)
                 upper_bounds.append(None)
@@ -1151,26 +1132,15 @@ def generate_detailed_forecast(res, group_eng, product, forecast_weeks, forecast
             # Update the sales volume in the current data for the next iteration
             forecast_history.loc[forecast_history.index[-1], 'sales_volume'] = forecast_value
             
-            # Calculate confidence intervals with increasing width over time
+            # Calculate confidence intervals via residual bootstrapping
             if include_confidence:
-                # Get error metrics
-                mae = metrics.get('MAE', 0)
-                rmse = metrics.get('RMSE', 0)
-                error_estimate = (0.7 * mae) + (0.3 * rmse)
-                
-                # Get z-score based on confidence level
-                z_lookup = {0.99: 2.58, 0.95: 1.96, 0.9: 1.645, 0.85: 1.44, 0.8: 1.28}
-                z_score = z_lookup.get(confidence_level, 1.96)
-                
-                # Increase uncertainty for longer forecast horizons
-                step_factor = 1 + 0.15 * (i + 1)  # 15% increase per step
-                
-                # Calculate margin of error
-                margin = z_score * error_estimate * step_factor
-                
-                # Ensure lower bound is non-negative
-                lower_bounds.append(max(0, forecast_value - margin))
-                upper_bounds.append(forecast_value + margin)
+                residuals = np.asarray(res.get('residuals', np.array([0.0])))
+                step_factor = 1 + 0.15 * (i + 1)
+                samples = forecast_value + np.random.choice(residuals, size=1000, replace=True) * step_factor
+                lower_q = (1 - confidence_level) / 2
+                upper_q = 1 - lower_q
+                lower_bounds.append(max(0, np.quantile(samples, lower_q)))
+                upper_bounds.append(np.quantile(samples, upper_q))
             else:
                 lower_bounds.append(None)
                 upper_bounds.append(None)
